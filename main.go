@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
 	"log"
@@ -23,17 +24,18 @@ func enablePingReply() {
 		log.Fatalf("Failed to enable ping reply: %v", err)
 	}
 }
+
+// HandleTCP handle TCP package and send res back
 func HandleTCP(addr net.Addr, data []byte) ([]byte, error) {
-	// get port from data and convert it
-	//log.Println(data)
-	//port_binary := data[2:4]
-	//portInt := binary.BigEndian.Uint16(port_binary)
-	//addr = &net.TCPAddr{
-	//	IP:   addr.(*net.IPAddr).IP,
-	//	Port: int(portInt),
-	//}
+	log.Println(data)
+	port_binary := data[2:4]
+	portInt := binary.BigEndian.Uint16(port_binary)
+	addr = &net.TCPAddr{
+		IP:   addr.(*net.IPAddr).IP,
+		Port: int(portInt),
+	}
 	log.Printf("Connecting to %v", "127.0.0.1:8082")
-	conn, err := net.Dial("tcp", "127.0.0.1:8082")
+	conn, err := net.Dial("tcp", "government.ru:80")
 	if err != nil {
 		log.Println("Failed to connect to %v: %v", addr, err)
 		return nil, err
@@ -41,8 +43,9 @@ func HandleTCP(addr net.Addr, data []byte) ([]byte, error) {
 	}
 	defer conn.Close()
 	_, err = conn.Write(data)
-	buf := make([]byte, 1500)
+	buf := make([]byte, 65535)
 	n, err := conn.Read(buf)
+	log.Printf(string(buf))
 	if err != nil {
 		log.Println("Failed to write to connection: %v", err)
 		return nil, err
@@ -60,8 +63,9 @@ func WriteBytes(conn *icmp.PacketConn, bytes []byte, addr net.Addr) {
 
 func handleICMPPackets(conn *icmp.PacketConn) {
 	for {
-		buf := make([]byte, 1500)
+		buf := make([]byte, 65535)
 		n, addr, err := conn.ReadFrom(buf)
+		log.Println(addr)
 		if err != nil {
 			log.Fatalf("Failed to read from connection: %v", err)
 		}
@@ -113,7 +117,7 @@ func main() {
 		}
 	}()
 
-	conn, err := icmp.ListenPacket("ip4:icmp", "172.17.200.86")
+	conn, err := icmp.ListenPacket("ip4:icmp", "0.0.0.0")
 	if err != nil {
 		log.Fatalf("Failed to listen for ICMP packets: %v", err)
 	}
