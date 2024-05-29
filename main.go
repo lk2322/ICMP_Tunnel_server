@@ -1,11 +1,15 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/binary"
+	"fmt"
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -25,38 +29,103 @@ func enablePingReply() {
 	}
 }
 
-// HandleTCP handle TCP package and send res back
-func HandleTCP(addr net.Addr, data []byte) ([]byte, error) {
-	log.Println(data)
-	port_binary := data[2:4]
-	portInt := binary.BigEndian.Uint16(port_binary)
-	addr = &net.TCPAddr{
-		IP:   addr.(*net.IPAddr).IP,
-		Port: int(portInt),
-	}
-	log.Printf("Connecting to %v", "127.0.0.1:8082")
-	conn, err := net.Dial("tcp", "government.ru:80")
-	if err != nil {
-		log.Println("Failed to connect to %v: %v", addr, err)
-		return nil, err
+func Csum(data []byte, srcip, dstip [4]byte) uint16 {
 
+	pseudoHeader := []byte{
+		srcip[0], srcip[1], srcip[2], srcip[3],
+		dstip[0], dstip[1], dstip[2], dstip[3],
+		0,                  // zero
+		6,                  // protocol number (6 == TCP)
+		0, byte(len(data)), // TCP length (16 bits), not inc pseudo header
+	}
+
+	sumThis := make([]byte, 0, len(pseudoHeader)+len(data))
+	sumThis = append(sumThis, pseudoHeader...)
+	sumThis = append(sumThis, data...)
+	//fmt.Printf("% x\n", sumThis)
+
+	lenSumThis := len(sumThis)
+	var nextWord uint16
+	var sum uint32
+	for i := 0; i+1 < lenSumThis; i += 2 {
+		nextWord = uint16(sumThis[i])<<8 | uint16(sumThis[i+1])
+		sum += uint32(nextWord)
+	}
+	if lenSumThis%2 != 0 {
+		//fmt.Println("Odd byte")
+		sum += uint32(sumThis[len(sumThis)-1])
+	}
+
+	// Add back any carry, and any carry from adding the carry
+	sum = (sum >> 16) + (sum & 0xffff)
+	sum = sum + (sum >> 16)
+
+	// Bitwise complement
+	return uint16(^sum)
+}
+
+// HandleIP обрабатывает IP-пакет, отправляет его на удаленный узел и возвращает ответ
+func HandleHTTP(data []byte) ([]byte, error) {
+	// Проверка минимального размера IP-заголовка
+	if len(data) < 20 {
+		return nil, fmt.Errorf("invalid IP packet")
+	}
+	// Извлечение IP-адреса назначения из IP-заголовка
+	srcIP := net.IPv4(95, 217, 146, 251)
+	dstIP := net.IPv4(data[16], data[17], data[18], data[19])
+
+	// Извлечение протокола из IP-заголовка
+	protocol := data[9]
+	if protocol != 6 {
+		return nil, fmt.Errorf("only TCP protocol is supported")
+	}
+
+	// Извлечение порта назначения из TCP-заголовка
+	tcpHeaderOffset := 20
+	dstPort := binary.BigEndian.Uint16(data[tcpHeaderOffset+2 : tcpHeaderOffset+4])
+	srcPort := binary.BigEndian.Uint16(data[tcpHeaderOffset : tcpHeaderOffset+2])
+
+	// Создание TCP-адреса
+	addr := &net.IPAddr{
+		IP: dstIP,
+	}
+
+	// Установка TCP-соединения
+	conn, err := net.DialIP("ip4:tcp", nil, addr)
+	if err != nil {
+		log.Printf("Failed to connect to %v: %v", addr, err)
+		return nil, err
 	}
 	defer conn.Close()
-	_, err = conn.Write(data)
-	buf := make([]byte, 65535)
-	n, err := conn.Read(buf)
-	log.Printf(string(buf))
+	tcp := data[20:]
+	checksum := Csum(tcp, [4]byte(srcIP.To4()), [4]byte(dstIP.To4()))
+	binary.BigEndian.PutUint16(tcp[16:18], checksum)
+	_, err = conn.Write(tcp)
 	if err != nil {
-		log.Println("Failed to write to connection: %v", err)
+		log.Printf("Failed to write to connection: %v", err)
 		return nil, err
 	}
-	return buf[:n], nil
 
+	// Чтение ответа
+	buf := make([]byte, 65535)
+	n, _, err := conn.ReadFrom(buf)
+	if err != nil {
+		log.Printf("Failed to read from connection: %v", err)
+		return nil, err
+	}
+	binary.BigEndian.PutUint16(buf[0:2], dstPort)
+	binary.BigEndian.PutUint16(buf[2:4], srcPort)
+	buf[16] = 0
+	buf[17] = 0
+	checksum = Csum(buf[:n], [4]byte(dstIP.To4()), [4]byte(srcIP.To4()))
+	binary.BigEndian.PutUint16(buf[16:18], checksum)
+	log.Printf("Response from %v: %v", addr, buf[:n])
+	return buf[:n], nil
 }
 
 func WriteBytes(conn *icmp.PacketConn, bytes []byte, addr net.Addr) {
 	if _, err := conn.WriteTo(bytes, addr); err != nil {
-		log.Fatalf("Failed to write to connection: %v", err)
+		log.Println("Failed to write to connection: %v", err)
 	}
 
 }
@@ -74,30 +143,53 @@ func handleICMPPackets(conn *icmp.PacketConn) {
 			log.Println("Failed to parse ICMP message: %v", err)
 		}
 		log.Printf("Get ICMP packet Type: %v Code: %v \n", int(msg.Type.(ipv4.ICMPType)), msg.Code)
-		var bytes []byte
 		switch msg.Code {
 		case 255:
 			// Handle "our" packet
 			msg.Type = ipv4.ICMPTypeEchoReply
 			go func() {
-				data, err := HandleTCP(addr, msg.Body.(*icmp.Echo).Data)
+				r := &bytes.Buffer{}
+				_, err = r.Write(msg.Body.(*icmp.Echo).Data)
+				if err != nil {
+					log.Println(err)
+					return
+				}
+				req, err := http.ReadRequest(bufio.NewReader(r))
+
+				if err != nil {
+					log.Println(1, err)
+					return
+				}
+				log.Println(req)
+				resp, err := http.DefaultTransport.RoundTrip(req)
+				if err != nil {
+					log.Println(2, err)
+					return
+				}
+				data := &bytes.Buffer{}
+				err = resp.Write(data)
+				if err != nil {
+					log.Println(3, err)
+					return
+				}
+
 				if err != nil {
 					return
 				}
 				msg.Body = &icmp.Echo{
 					ID:   msg.Body.(*icmp.Echo).ID,
 					Seq:  msg.Body.(*icmp.Echo).Seq,
-					Data: data,
+					Data: data.Bytes(),
 				}
-				bytes, _ = msg.Marshal(nil)
-				WriteBytes(conn, bytes, addr)
+				byts, _ := msg.Marshal(nil)
+				WriteBytes(conn, byts, addr)
 				log.Printf("Sent ICMP packet Type: %v Code: %v \n", int(msg.Type.(ipv4.ICMPType)), msg.Code)
 
 			}()
 		default:
 			msg.Type = ipv4.ICMPTypeEchoReply
-			bytes, _ = msg.Marshal(nil)
-			WriteBytes(conn, bytes, addr)
+			byts, _ := msg.Marshal(nil)
+			WriteBytes(conn, byts, addr)
 			log.Printf("Sent ICMP packet Type: %v Code: %v \n", int(msg.Type.(ipv4.ICMPType)), msg.Code)
 
 		}
